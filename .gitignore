@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Distribution/packaging
+*.egg-info/
+dist/
+*.egg
+build/
+
+# Cython generated
+C_library/motion_plan_lib.c
+
+# Compiled native
+*.so
+*.o
+*.a
+
+# CMake build artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Logs
+logs/
+*.log
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
