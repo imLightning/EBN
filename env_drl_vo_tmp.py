@@ -91,9 +91,10 @@ class CrowdSim:
         self.human_num = None
         self.static_obstacle_num = None
 
-        self.layer_len = [0.2, 0.2, 0.2]
+        self.emotion_min = 0.2
+        self.emotion_max = 0.2
+        self.emotion_range = self.emotion_max - self.emotion_min
         self.emotion_positive_prob = 0.5
-        self.human_emotions = ['positive', 'negative']
         self.emotion_comfort_distance = [0.5, 1.0]
         self.humans = None
         self.human_v_pref = 1.0
@@ -135,6 +136,9 @@ class CrowdSim:
 
         # log lidar, robot, and humans
         self.log_env = {}
+
+    def get_emotion_layer_len(self, emotion_value):
+        return self.emotion_min + self.emotion_range * emotion_value
 
     def generate_random_static_obstacle(self):
         self.static_obstacle_num = int(np.random.randint(self.static_obstacle_num_max, size=1)[0] + 1)
@@ -212,12 +216,7 @@ class CrowdSim:
                 # px, py, gx, gy, vx, vy, theta
                 human_theta = atan2(-py - py, -px - px)
                 human.set(px, py, -px, -py, 0, 0, human_theta)
-                prob = np.random.random(1)[0]
-                if prob < self.emotion_positive_prob:
-                    emotion_idx = 0 # positive index
-                else:
-                    emotion_idx = 1 # negative index
-                human.emotion = self.human_emotions[emotion_idx]
+                human.emotion_value = np.random.uniform(0.0, 1.0)
                 break
         
         return human
@@ -239,14 +238,12 @@ class CrowdSim:
         for i in range (num_circle_human):
             set_circles(3 * i    , self.humans[i].px)
             set_circles(3 * i + 1, self.humans[i].py)
-            if self.humans[i].emotion == 'positive':
-                set_circles(3 * i + 2, self.humans[i].radius + self.layer_len[1] * layer)
-            else:
-                set_circles(3 * i + 2, self.humans[i].radius + self.layer_len[2] * layer)
+            emotion_layer_len = self.get_emotion_layer_len(self.humans[i].emotion_value)
+            set_circles(3 * i + 2, self.humans[i].radius + emotion_layer_len * layer)
         for i in range (num_circle_obstacle):
             set_circles(3 * (i + num_circle_human)    , self.static_obstacles[i, 0])
             set_circles(3 * (i + num_circle_human) + 1, self.static_obstacles[i, 1])
-            set_circles(3 * (i + num_circle_human) + 2, self.static_obstacles[i, 2] + self.layer_len[0] * layer)
+            set_circles(3 * (i + num_circle_human) + 2, self.static_obstacles[i, 2] + self.emotion_min * layer)
         set_robot_pose(robot_pose[0], robot_pose[1], robot_pose[2])
         cal_laser()
         if layer == 0:
@@ -274,15 +271,12 @@ class CrowdSim:
     def is_collision(self, layer):
         for i in range(self.human_num):
             dis = hypot(self.robot.px - self.humans[i].px, self.robot.py - self.humans[i].py)
-            if self.humans[i].emotion == 'positive':
-                if dis < self.robot.radius + self.humans[i].radius + layer * self.layer_len[1]:
-                    return True
-            else :
-                if dis < self.robot.radius + self.humans[i].radius + layer * self.layer_len[2]:
-                    return True
+            emotion_layer_len = self.get_emotion_layer_len(self.humans[i].emotion_value)
+            if dis < self.robot.radius + self.humans[i].radius + layer * emotion_layer_len:
+                return True
         for i in range(self.static_obstacle_num):
             dis = hypot(self.robot.px - self.static_obstacles[i, 0], self.robot.py - self.static_obstacles[i, 1])
-            if dis < self.robot.radius + self.static_obstacles[i, 2] + layer * self.layer_len[0]:
+            if dis < self.robot.radius + self.static_obstacles[i, 2] + layer * self.emotion_min:
                 return True
         return False
     
@@ -617,11 +611,7 @@ class CrowdSim:
             self.log_env['goal'][self.global_step] = np.array([self.robot.gx, self.robot.gy])
             humans_info = np.zeros((self.human_num, 4), dtype=np.float32)
             for i in range (self.human_num):
-                if self.humans[i].emotion == 'negative':
-                    human_emotion = 1.0
-                else:
-                    human_emotion = 0.0
-                humans_info[i] = np.array([self.humans[i].px, self.humans[i].py, self.humans[i].radius, human_emotion], dtype=np.float32)
+                humans_info[i] = np.array([self.humans[i].px, self.humans[i].py, self.humans[i].radius, self.humans[i].emotion_value], dtype=np.float32)
             self.log_env['humans'][self.global_step] = humans_info
             static_obstacles_info = np.zeros((self.static_obstacle_num, 3), dtype=np.float32)
             for i in range (self.static_obstacle_num):
@@ -736,11 +726,7 @@ class CrowdSim:
             self.log_env['goal'][self.global_step] = np.array([self.robot.gx, self.robot.gy])
             humans_info = np.zeros((self.human_num, 4), dtype=np.float32)
             for i in range(self.human_num):
-                if self.humans[i].emotion == 'negative':
-                    human_emotion = 1.0
-                else:
-                    human_emotion = 0.0
-                humans_info[i] = np.array([self.humans[i].px, self.humans[i].py, self.humans[i].radius, human_emotion], dtype=np.float32)
+                humans_info[i] = np.array([self.humans[i].px, self.humans[i].py, self.humans[i].radius, self.humans[i].emotion_value], dtype=np.float32)
             self.log_env['humans'][self.global_step] = humans_info
             static_obstacles_info = np.zeros((self.static_obstacle_num, 3), dtype=np.float32)
             for i in range (self.static_obstacle_num):

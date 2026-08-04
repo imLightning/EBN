@@ -16,8 +16,7 @@ class Human():
         self.vy = None
         self.theta = None
         self.time_step = None
-        # positive, negative
-        self.emotion = 'positive'
+        self.emotion_value = np.random.uniform(0.0, 1.0)
         self.emotion_visible = False
 
     def act(self, ob, has_robot=False):

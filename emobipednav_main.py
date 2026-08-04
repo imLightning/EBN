@@ -132,7 +132,7 @@ def main():
     # Max time steps to run environment
     parser.add_argument('--max_timesteps', default=6e6, type=int)
     # replay buffer
-    parser.add_argument("--replay_buffer_capacity", default=200000, type=int)
+    parser.add_argument("--replay_buffer_capacity", default=160000, type=int)
     
     # training
     parser.add_argument('--batch_size', default=128, type=int)
@@ -180,11 +180,11 @@ def main():
     parser.add_argument("--lidar_dim", type=int, default=1800)
     parser.add_argument("--lidar_feature_dim", type=int, default=50)
     # lidar to image
-    parser.add_argument('--image_size', default=100, type=int)
-    parser.add_argument('--frame_stack', default=9, type=int)
+    parser.add_argument('--image_size', default=84, type=int)
+    parser.add_argument('--frame_stack', default=7, type=int)
     parser.add_argument('--grid_map', action='store_true', default=False)
-    # 2 robot speed, 2 local goal
-    parser.add_argument("--robot_goal_state_dim", type=int, default=4)
+    # 2 robot speed, 2 local goal, 2 emotion stats (mean, max)
+    parser.add_argument("--robot_goal_state_dim", type=int, default=6)
     parser.add_argument("--laser_angle_resolute", type=float, default=0.003490659)
     parser.add_argument("--laser_min_range", type=float, default=0.27)
     parser.add_argument("--laser_max_range", type=float, default=6.0)

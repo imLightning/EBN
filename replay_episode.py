@@ -31,7 +31,8 @@ radius_robot = 0.3
 
 draw_discomfort = False
 static_discomfort = 0.2
-emotion_discomfort = [0.2, 0.35, 0.5]
+emotion_min = 0.2
+emotion_range = 0.3
 
 #####real time plot for simulation case########
 radius = 0.3
@@ -58,7 +59,7 @@ for i in range(steps):
         
         
         human_circle_discomfort = plt.Circle(humans[i][human_i, 0:2], 
-                                            radius + emotion_discomfort[int(humans[i][human_i, 3])], 
+                                            humans[i][human_i, 2] + emotion_min + emotion_range * humans[i][human_i, 3], 
                                             fill=False, color=human_color, linestyle='--')
         ax.add_artist(human_circle_discomfort)
         
