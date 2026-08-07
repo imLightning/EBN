@@ -31,8 +31,13 @@ class CrowdSim:
         self.use_angular = args.use_angular
         self.test_single = args.test_single
         self.grid_map = args.grid_map
-        
-        # last-time distance from the robot to the goal
+        # number of robots sharing the same crowd environment
+        self.robot_num = getattr(args, 'robot_num', 1)
+        # minimum spawn distance between robots
+        self.robot_min_spacing = 2.0
+
+        # last-time distance from each robot to its goal
+        self.goal_distance_last_list = [0.0 for _ in range(self.robot_num)]
         self.goal_distance_last = None
 
         
@@ -40,11 +45,14 @@ class CrowdSim:
         self.emotion_min = 0.2
         self.emotion_max = 0.5
         self.emotion_range = self.emotion_max - self.emotion_min
-        self.scan_intersection = np.zeros((self.n_laser, 2, 2), dtype=np.float32) # used for visualization
-
-        # laser state
-        self.scan_current = self.laser_max_range * np.ones(self.n_laser, dtype=np.float32)
-        self.scan_current_layer = self.laser_max_range * np.ones(self.n_laser, dtype=np.float32)
+        # per-robot laser state
+        self.scan_intersection_list = [np.zeros((self.n_laser, 2, 2), dtype=np.float32) for _ in range(self.robot_num)] # used for visualization
+        self.scan_current_list = [self.laser_max_range * np.ones(self.n_laser, dtype=np.float32) for _ in range(self.robot_num)]
+        self.scan_current_layer_list = [self.laser_max_range * np.ones(self.n_laser, dtype=np.float32) for _ in range(self.robot_num)]
+        # aliases of robot 0, keep backward compatibility
+        self.scan_intersection = self.scan_intersection_list[0]
+        self.scan_current = self.scan_current_list[0]
+        self.scan_current_layer = self.scan_current_layer_list[0]
         
         self.global_time = 0.0
         self.global_step = 0
@@ -93,10 +101,14 @@ class CrowdSim:
         self.rectangles = None
         self.action_range = action_range
         self.action_choices = action_choices
-        self.robot = Robot(radius=0.3)
-        self.robot.time_step = self.time_step
-        self.robot.v_pref = action_range[1, 0]
-        self.action_last = np.zeros(2)
+        self.robots = [Robot(radius=0.3) for _ in range(self.robot_num)]
+        for robot in self.robots:
+            robot.time_step = self.time_step
+            robot.v_pref = action_range[1, 0]
+        # alias of the first (trained) robot, keeps backward compatibility
+        self.robot = self.robots[0]
+        self.action_last_list = [np.zeros(2) for _ in range(self.robot_num)]
+        self.action_last = self.action_last_list[0]
         self.acceleration = [1.0, 1.0]
         self.robot_visible_threshold = 1.0
 
@@ -123,9 +135,10 @@ class CrowdSim:
         if digit_env is not None:
             self.repeat_action_num = int(self.time_step / digit_env.cfg.control.control_dt)
         
-        # lidar to image
+        # lidar to image, one frame queue per robot
         self.frame_stack = args.frame_stack
-        self.frames = deque([], maxlen=self.frame_stack)
+        self.frames_list = [deque([], maxlen=self.frame_stack) for _ in range(self.robot_num)]
+        self.frames = self.frames_list[0]
         self.image_size = args.image_size
         self.single_frame = np.zeros((1, self.image_size, self.image_size), dtype=np.uint8)
         self.r_resolution = self.laser_max_range / self.image_size
@@ -203,7 +216,7 @@ class CrowdSim:
             px = self.circle_radius * np.cos(angle) + px_noise
             py = self.circle_radius * np.sin(angle) + py_noise
             collide = False
-            for agent in [self.robot] + self.humans:
+            for agent in self.robots + self.humans:
                 if agent is None:
                     continue
                 min_dist = human.radius + agent.radius + self.discomfort_dist
@@ -227,14 +240,16 @@ class CrowdSim:
         return human
 
         
-    def get_lidar(self, layer):
+    def get_lidar(self, layer, robot_idx=0):
         scan = np.zeros(self.n_laser, dtype=np.float32)
+        robot = self.robots[robot_idx]
         # robot_pose = np.array([self.robot.px, self.robot.py, self.robot.theta])
-        robot_pose = np.array([self.robot.px, self.robot.py, self.robot.theta], dtype=np.float32)
+        robot_pose = np.array([robot.px, robot.py, robot.theta], dtype=np.float32)
         num_line = self.lines.shape[0]
         num_circle_human = self.human_num
         num_circle_obstacle = self.static_obstacle_num
-        InitializeEnv(num_line, num_circle_human + num_circle_obstacle, self.n_laser, self.laser_angle_resolute)
+        num_circle_robot = self.robot_num - 1
+        InitializeEnv(num_line, num_circle_human + num_circle_obstacle + num_circle_robot, self.n_laser, self.laser_angle_resolute)
         for i in range (num_line):
             set_lines(4 * i    , self.lines[i][0][0])
             set_lines(4 * i + 1, self.lines[i][0][1])
@@ -249,23 +264,33 @@ class CrowdSim:
             set_circles(3 * (i + num_circle_human)    , self.static_obstacles[i, 0])
             set_circles(3 * (i + num_circle_human) + 1, self.static_obstacles[i, 1])
             set_circles(3 * (i + num_circle_human) + 2, self.static_obstacles[i, 2] + self.obstacle_layer_len * layer)
+        # other robots are plain circles in the laser scene
+        robot_circle_idx = 0
+        for j in range(self.robot_num):
+            if j == robot_idx:
+                continue
+            circle_idx = num_circle_human + num_circle_obstacle + robot_circle_idx
+            set_circles(3 * circle_idx    , self.robots[j].px)
+            set_circles(3 * circle_idx + 1, self.robots[j].py)
+            set_circles(3 * circle_idx + 2, self.robots[j].radius + self.obstacle_layer_len * layer)
+            robot_circle_idx += 1
         set_robot_pose(robot_pose[0], robot_pose[1], robot_pose[2])
         cal_laser()
         if layer == 0:
-            self.scan_intersection = np.zeros((self.n_laser, 2, 2), dtype=np.float32)
+            self.scan_intersection_list[robot_idx].fill(0.0)
         for i in range(self.n_laser):
             scan[i] = get_scan(i)
             if layer == 0:
                 ### used for visualization
-                self.scan_intersection[i, 0, 0] = self.robot.px
-                self.scan_intersection[i, 0, 1] = self.robot.py
-                self.scan_intersection[i, 1, 0] = get_scan_line(4 * i + 2)
-                self.scan_intersection[i, 1, 1] = get_scan_line(4 * i + 3)
+                self.scan_intersection_list[robot_idx][i, 0, 0] = robot.px
+                self.scan_intersection_list[robot_idx][i, 0, 1] = robot.py
+                self.scan_intersection_list[robot_idx][i, 1, 0] = get_scan_line(4 * i + 2)
+                self.scan_intersection_list[robot_idx][i, 1, 1] = get_scan_line(4 * i + 3)
                 ### used for visualization
         if layer == 0:
-            self.scan_current = np.clip(scan, self.laser_min_range, self.laser_max_range)
+            np.copyto(self.scan_current_list[robot_idx], np.clip(scan, self.laser_min_range, self.laser_max_range))
         elif layer == 1:
-            self.scan_current_layer = np.clip(scan, self.laser_min_range, self.laser_max_range)
+            np.copyto(self.scan_current_layer_list[robot_idx], np.clip(scan, self.laser_min_range, self.laser_max_range))
         ReleaseEnv()
     
     def get_xy_grid_map(self, i, scan_range):
@@ -291,57 +316,69 @@ class CrowdSim:
             y_grid_map = self.image_size - 1
         return x_grid_map, y_grid_map
 
-    def get_frame(self):
-        self.single_frame = np.zeros((1, self.image_size, self.image_size), dtype=np.uint8)
+    def get_frame(self, robot_idx=0):
+        single_frame = np.zeros((1, self.image_size, self.image_size), dtype=np.uint8)
+        scan_current = self.scan_current_list[robot_idx]
+        scan_current_layer = self.scan_current_layer_list[robot_idx]
         if self.grid_map:
-            self.get_lidar(0)
+            self.get_lidar(0, robot_idx)
             for i in range(self.n_laser):
-                if self.scan_current[i] == self.laser_max_range:
+                if scan_current[i] == self.laser_max_range:
                     continue
-                x_grid_map, y_grid_map = self.get_xy_grid_map(i, self.scan_current[i])
-                self.single_frame[0, x_grid_map, y_grid_map] = 255
-            self.get_lidar(1)
+                x_grid_map, y_grid_map = self.get_xy_grid_map(i, scan_current[i])
+                single_frame[0, x_grid_map, y_grid_map] = 255
+            self.get_lidar(1, robot_idx)
             for i in range(self.n_laser):
-                if self.scan_current_layer[i] == self.laser_max_range:
+                if scan_current_layer[i] == self.laser_max_range:
                     continue
-                x_grid_map, y_grid_map = self.get_xy_grid_map(i, self.scan_current_layer[i])
-                if self.single_frame[0, x_grid_map, y_grid_map] != 255:
-                    self.single_frame[0, x_grid_map, y_grid_map] = 127
+                x_grid_map, y_grid_map = self.get_xy_grid_map(i, scan_current_layer[i])
+                if single_frame[0, x_grid_map, y_grid_map] != 255:
+                    single_frame[0, x_grid_map, y_grid_map] = 127
         else:
-            self.get_lidar(0)
+            self.get_lidar(0, robot_idx)
             for i in range(self.n_laser):
-                if self.scan_current[i] == self.laser_max_range:
+                if scan_current[i] == self.laser_max_range:
                     continue
                 j = int(i / self.theta_resolution)
                 if j >= self.image_size:
                     j = self.image_size - 1
-                k = int(self.scan_current[i] / self.r_resolution)
+                k = int(scan_current[i] / self.r_resolution)
                 if k >= self.image_size:
                     k = self.image_size - 1
-                self.single_frame[0, j, k] = 255
+                single_frame[0, j, k] = 255
 
-            self.get_lidar(1)
+            self.get_lidar(1, robot_idx)
             for i in range(self.n_laser):
-                if self.scan_current_layer[i] == self.laser_max_range:
+                if scan_current_layer[i] == self.laser_max_range:
                     continue
                 j = int(i / self.theta_resolution)
                 if j >= self.image_size:
                     j = self.image_size - 1
-                k = int(self.scan_current_layer[i] / self.r_resolution)
+                k = int(scan_current_layer[i] / self.r_resolution)
                 if k >= self.image_size:
                     k = self.image_size - 1
-                if self.single_frame[0, j, k] != 255:
-                    self.single_frame[0, j, k] = 127
+                if single_frame[0, j, k] != 255:
+                    single_frame[0, j, k] = 127
 
-    def is_collision(self, layer):
+        return single_frame
+
+    def is_collision(self, layer, robot_idx=0):
+        robot = self.robots[robot_idx]
         for i in range(self.human_num):
-            dis = hypot(self.robot.px - self.humans[i].px, self.robot.py - self.humans[i].py)
+            dis = hypot(robot.px - self.humans[i].px, robot.py - self.humans[i].py)
             emotion_layer_len = self.get_emotion_layer_len(self.humans[i].emotion_value)
-            if dis < self.robot.radius + self.humans[i].radius + layer * emotion_layer_len:
+            if dis < robot.radius + self.humans[i].radius + layer * emotion_layer_len:
                 return True
         for i in range(self.static_obstacle_num):
-            dis = hypot(self.robot.px - self.static_obstacles[i, 0], self.robot.py - self.static_obstacles[i, 1])
-            if dis < self.robot.radius + self.static_obstacles[i, 2] + layer * self.obstacle_layer_len:
+            dis = hypot(robot.px - self.static_obstacles[i, 0], robot.py - self.static_obstacles[i, 1])
+            if dis < robot.radius + self.static_obstacles[i, 2] + layer * self.obstacle_layer_len:
+                return True
+        # robot-robot collision
+        for j in range(self.robot_num):
+            if j == robot_idx:
+                continue
+            dis = hypot(robot.px - self.robots[j].px, robot.py - self.robots[j].py)
+            if dis < robot.radius + self.robots[j].radius + layer * self.obstacle_layer_len:
                 return True
         return False
 
@@ -415,7 +452,43 @@ class CrowdSim:
         return action_dwa
     
         
+    def _sync_mujoco_agents(self):
+        """Push the current pedestrians and obstacles into the MuJoCo scene so
+        that they appear in the offscreen recordings / live viewer of Digit."""
+        if self.digit_env is None:
+            return
+        pedestrians = np.zeros((self.human_num, 5), dtype=np.float32)
+        for i in range(self.human_num):
+            human = self.humans[i]
+            pedestrians[i] = np.array([human.px, human.py, human.radius, human.emotion_value,
+                                       self.get_emotion_layer_len(human.emotion_value)], dtype=np.float32)
+        self.digit_env.set_pedestrians(pedestrians)
+        if self.static_obstacles is not None:
+            self.digit_env.set_obstacles(self.static_obstacles)
+        # the second robot is rendered as a second Digit ghost in the scene
+        if self.robot_num > 1:
+            self.digit_env.set_second_robot_target(
+                np.array([self.robots[1].px, self.robots[1].py, self.robots[1].theta], dtype=np.float32))
+            # goal markers for the other robots (robot 0's goal is the fixed green disc)
+            goals = np.zeros((self.robot_num - 1, 2), dtype=np.float32)
+            for j in range(1, self.robot_num):
+                goals[j - 1] = np.array([self.robots[j].gx, self.robots[j].gy], dtype=np.float32)
+            self.digit_env.set_robot_goals(goals)
+
     def step(self, action, eval=False, save_data=False):
+        if isinstance(action, (list, tuple)):
+            actions = [np.asarray(a, dtype=np.float32) for a in action]
+        else:
+            actions = [np.asarray(action, dtype=np.float32)]
+        if len(actions) == 1 and self.robot_num > 1:
+            actions = actions * self.robot_num
+
+        # a robot that has already reached its goal keeps still
+        for j in range(self.robot_num):
+            if self.robots[j].get_goal_distance() < self.robots[j].radius - 0.2:
+                actions[j] = np.zeros(2, dtype=np.float32)
+
+        # human actions, humans observe all other humans, obstacles and robots
         human_actions = np.zeros((self.human_num, 2), dtype=np.float32)
         for i in range(self.human_num):
             # observation for humans is always coordinates
@@ -426,104 +499,121 @@ class CrowdSim:
                         self.static_obstacles[k, 1], 
                         0.0, 0.0, self.static_obstacles[k, 2])
                         )
-            if self.robot_visible_threshold * hypot(self.robot.vx, self.robot.vy) < hypot(self.humans[i].vx, self.humans[i].vy):
-                ob.append(ObservableState(self.robot.px, self.robot.py, self.robot.vx, self.robot.vy, self.robot.radius))
-                action_temp = self.humans[i].act(ob, has_robot=True)
-                human_actions[i] = np.array([action_temp[0], action_temp[1]], dtype=np.float32)
-            else:
-                action_temp = self.humans[i].act(ob)
-                human_actions[i] = np.array([action_temp[0], action_temp[1]], dtype=np.float32)
+            has_robot = False
+            for j in range(self.robot_num):
+                if self.robot_visible_threshold * hypot(self.robots[j].vx, self.robots[j].vy) < hypot(self.humans[i].vx, self.humans[i].vy):
+                    ob.append(self.robots[j].get_observable_state())
+                    has_robot = True
+            action_temp = self.humans[i].act(ob, has_robot=has_robot)
+            human_actions[i] = np.array([action_temp[0], action_temp[1]], dtype=np.float32)
 
-        # update robot states
-        action_copy = np.array([action[0], action[1]])
-        if self.digit_env is None:
-            robot_theta = self.robot.theta + action[1] * self.time_step
-            if robot_theta > np.pi:
-                robot_theta -= (2.0 * np.pi)
-            elif robot_theta < -np.pi:
-                robot_theta += (2.0 * np.pi)
-            if self.robot_test_model == 'differential' or self.robot_model == 'differential':
-                robot_x = self.robot.px + action[0] * self.time_step * cos(robot_theta)
-                robot_y = self.robot.py + action[0] * self.time_step * sin(robot_theta)
-                
-            elif self.robot_test_model == 'lip' or self.robot_model == 'lip':
-                pf_x = (self.action_last[0] * self.cosh_wt - action[0]) / (self.w * self.sinh_wt)
-                x_n =  pf_x - pf_x * self.cosh_wt + self.action_last[0] * self.sinh_wt / self.w
-                robot_x = self.robot.px + x_n * cos(robot_theta)
-                robot_y = self.robot.py + x_n * sin(robot_theta)
-        else:
-            vel_command_to_digit = {
-                'x_vel': action[0],
-                'y_vel': 0.0,
-                'yaw_vel': action[1]
-            }
-            self.digit_env.set_vel_command(vel_command_to_digit)
-            
-            for _ in range(self.repeat_action_num):
-                st_time = time()
-                self.digit_env.step(np.zeros(12))
-                if self.mujoco_visualize:
-                    end_time = time()
-                    if (end_time - st_time) < self.digit_env.cfg.control.control_dt:
-                        sleep(self.digit_env.cfg.control.control_dt - (end_time - st_time))
-                self.digit_qpos.append(self.digit_env.qpos)
-            robot_x = self.digit_env.root_xy_pos[0]
-            robot_y = self.digit_env.root_xy_pos[1]
-            robot_theta = self.digit_env.root_rpy[2]
-        action_copy[0] = hypot(robot_y - self.robot.py, robot_x - self.robot.px) / self.time_step
-            
-        # update states
-        self.robot.update_states(robot_x, robot_y, robot_theta, action_copy, differential=True)
-       
+        # update humans first so that the MuJoCo recording shows pedestrians in
+        # their updated positions while the robot moves
         for i in range(self.human_num):
             self.humans[i].update_states(human_actions[i])
 
-        # get new laser scan and grid map
-        self.get_frame() 
-        
-        self.frames.append(self.single_frame)
-        assert len(self.frames) == self.frame_stack
-        lidar_image = np.concatenate(list(self.frames), axis=0)
+        # update robot states
+        for j in range(self.robot_num):
+            action_j = actions[j]
+            if j == 0 and self.digit_env is not None:
+                vel_command_to_digit = {
+                    'x_vel': action_j[0],
+                    'y_vel': 0.0,
+                    'yaw_vel': action_j[1]
+                }
+                self.digit_env.set_vel_command(vel_command_to_digit)
+                self._sync_mujoco_agents()
+                
+                for _ in range(self.repeat_action_num):
+                    st_time = time()
+                    self.digit_env.step(np.zeros(12))
+                    if self.mujoco_visualize:
+                        end_time = time()
+                        if (end_time - st_time) < self.digit_env.cfg.control.control_dt:
+                            sleep(self.digit_env.cfg.control.control_dt - (end_time - st_time))
+                    self.digit_qpos.append(self.digit_env.qpos)
+                robot_x = self.digit_env.root_xy_pos[0]
+                robot_y = self.digit_env.root_xy_pos[1]
+                robot_theta = self.digit_env.root_rpy[2]
+            else:
+                robot_theta = self.robots[j].theta + action_j[1] * self.time_step
+                if robot_theta > np.pi:
+                    robot_theta -= (2.0 * np.pi)
+                elif robot_theta < -np.pi:
+                    robot_theta += (2.0 * np.pi)
+                if self.robot_test_model == 'lip' or self.robot_model == 'lip':
+                    pf_x = (self.action_last_list[j][0] * self.cosh_wt - action_j[0]) / (self.w * self.sinh_wt)
+                    x_n =  pf_x - pf_x * self.cosh_wt + self.action_last_list[j][0] * self.sinh_wt / self.w
+                    robot_x = self.robots[j].px + x_n * cos(robot_theta)
+                    robot_y = self.robots[j].py + x_n * sin(robot_theta)
+                else:
+                    # differential kinematics; also covers the other robots when
+                    # the trained robot is digit_mujoco (only robot 0 is the digit)
+                    robot_x = self.robots[j].px + action_j[0] * self.time_step * cos(robot_theta)
+                    robot_y = self.robots[j].py + action_j[0] * self.time_step * sin(robot_theta)
+            action_copy = np.array([action_j[0], action_j[1]])
+            action_copy[0] = hypot(robot_y - self.robots[j].py, robot_x - self.robots[j].px) / self.time_step
+                
+            # update states
+            self.robots[j].update_states(robot_x, robot_y, robot_theta, action_copy, differential=True)
+            self.action_last_list[j] = action_j
+        self.action_last = self.action_last_list[0]
+       
+        # get new laser scans and grid maps for all robots
+        lidar_images = []
+        for j in range(self.robot_num):
+            frame = self.get_frame(j)
+            self.frames_list[j].append(frame)
+            assert len(self.frames_list[j]) == self.frame_stack
+            lidar_images.append(np.concatenate(list(self.frames_list[j]), axis=0))
         
         self.global_time += self.time_step
-        
-        # if reaching goal
-        goal_dist = hypot(robot_x - self.robot.gx, robot_y - self.robot.gy)
-        if eval:
-            reaching_goal = goal_dist < (self.robot.radius - 0.1)
-        else:
-            reaching_goal = goal_dist < (self.robot.radius - 0.2)
 
-        # collision detection between the robot and humans
-        collision = self.is_collision(0)
-        collision_layer = self.is_collision(1)
+        # per-robot reward, done and info
+        rewards = []
+        dones = []
+        infos = []
+        for j in range(self.robot_num):
+            robot = self.robots[j]
+            # if reaching goal
+            goal_dist = hypot(robot.px - robot.gx, robot.py - robot.gy)
+            if eval:
+                reaching_goal = goal_dist < (robot.radius - 0.1)
+            else:
+                reaching_goal = goal_dist < (robot.radius - 0.2)
+
+            # collision detection between the robot and humans/obstacles/other robots
+            collision = self.is_collision(0, j)
+            collision_layer = self.is_collision(1, j)
+                
+            dis_goal_reward = self.goal_distance_factor * (self.goal_distance_last_list[j] - goal_dist)
+            # dis_goal_reward = 0.0
+            self.goal_distance_last_list[j] = goal_dist
             
-        dis_goal_reward = self.goal_distance_factor * (self.goal_distance_last - goal_dist)
-        # dis_goal_reward = 0.0
-        self.goal_distance_last = goal_dist
-        
-        # angular_reward = fabs(action[1] - self.action_last[1]) * self.angular_penalty
-        if self.use_angular:
-            angular_reward = fabs(action[1]) * self.angular_penalty
-        else:
-            angular_reward = 0.0
-        
-        self.action_last = action
-        reward = collision_layer * self.collision_layer_penalty + dis_goal_reward + angular_reward
-        if collision:
-            reward = self.collision_penalty
-            done = True
-            info = Collision()
-        elif reaching_goal:
-            reward = self.success_reward
-            done = True
-            info = ReachGoal()
-        elif collision_layer:
-            done = False
-            info = Danger(0.1)
-        else:
-            done = False
-            info = Nothing()
+            # angular_reward = fabs(action[1] - self.action_last[1]) * self.angular_penalty
+            if self.use_angular:
+                angular_reward = fabs(actions[j][1]) * self.angular_penalty
+            else:
+                angular_reward = 0.0
+            
+            reward = collision_layer * self.collision_layer_penalty + dis_goal_reward + angular_reward
+            if collision:
+                reward = self.collision_penalty
+                done = True
+                info = Collision()
+            elif reaching_goal:
+                reward = self.success_reward
+                done = True
+                info = ReachGoal()
+            elif collision_layer:
+                done = False
+                info = Danger(0.1)
+            else:
+                done = False
+                info = Nothing()
+            rewards.append(reward)
+            dones.append(done)
+            infos.append(info)
   
         for i, human in enumerate(self.humans):
             # let humans move circularly from two points
@@ -531,25 +621,15 @@ class CrowdSim:
                 self.humans[i].gx = -self.humans[i].gx
                 self.humans[i].gy = -self.humans[i].gy
 
-        dx = self.robot.gx - self.robot.px
-        dy = self.robot.gy - self.robot.py
-        theta = self.robot.theta
-        y_rel = dy * cos(theta) - dx * sin(theta)
-        x_rel = dy * sin(theta) + dx * cos(theta)
-        r = hypot(x_rel, y_rel)
-        t = atan2(y_rel, x_rel)
-
-        # get the observation
-        emotion_values = np.array([h.emotion_value for h in self.humans], dtype=np.float32)
-        robot_goal_emotion_state = np.array([r / self.square_width, t / np.pi, 
-                                             self.action_last[0] / self.action_range[1, 0],
-                                             self.action_last[1] / self.action_range[1, 1],
-                                             emotion_values.mean(), emotion_values.max()], dtype=np.float32)
+        # get the observations for all robots
+        robot_goal_emotion_states = []
+        for j in range(self.robot_num):
+            robot_goal_emotion_states.append(self._get_robot_goal_emotion_state(j))
         
         if save_data:
             all_obstacles = np.zeros((self.human_num + self.static_obstacle_num, 2), dtype=np.float32)
             self.global_step += 1
-            self.log_env['robot'][self.global_step] = np.array([self.robot.px, self.robot.py, action[0], action[1], self.robot.theta])
+            self.log_env['robot'][self.global_step] = np.array([self.robot.px, self.robot.py, actions[0][0], actions[0][1], self.robot.theta])
             self.log_env['goal'][self.global_step] = np.array([self.robot.gx, self.robot.gy])
             humans_info = np.zeros((self.human_num, 4), dtype=np.float32)
             for i in range (self.human_num):
@@ -569,7 +649,7 @@ class CrowdSim:
                 lasers[i] = np.array([laser[0][0], laser[0][1], laser[1][0], laser[1][1]], dtype=np.float32)
             self.log_env['laser'][self.global_step] = lasers
             
-        return lidar_image, robot_goal_emotion_state, reward, done, info
+        return lidar_images, robot_goal_emotion_states, rewards, dones, infos
     
     def save_video(self, steps, episodes):
         filename = 'eval_' + str(steps) + '_' + str(episodes)
@@ -580,16 +660,40 @@ class CrowdSim:
     def reset(self, seed=-1, save_data=False):
         self.global_time = 0.0
         self.global_step = 0
-        self.action_last = np.zeros(2)
         self.static_obstacles = None
         self.log_env = {}
         self.digit_qpos = []
         # px, py, gx, gy, vx, vy, theta
-        self.robot.set(-self.circle_radius, 0.0, self.circle_radius, 0.0, 0.0, 0.0, 0.0)
+        for j in range(self.robot_num):
+            self.action_last_list[j] = np.zeros(2)
+            if j == 0:
+                self.robots[0].set(-self.circle_radius, 0.0, self.circle_radius, 0.0, 0.0, 0.0, 0.0)
+            else:
+                # place robots on the circle opposite to robot 0 so that they
+                # are far apart (for N=2 they cross through the center), and
+                # resample until a minimum spacing to other robots is kept
+                base_angle = np.pi + j * 2.0 * np.pi / self.robot_num
+                for _ in range(20):
+                    angle = base_angle + np.random.uniform(-0.4, 0.4)
+                    px = self.circle_radius * np.cos(angle)
+                    py = self.circle_radius * np.sin(angle)
+                    ok = True
+                    for k in range(j):
+                        if hypot(px - self.robots[k].px, py - self.robots[k].py) < self.robot_min_spacing:
+                            ok = False
+                            break
+                    if ok:
+                        break
+                self.robots[j].set(px, py, -px, -py, 0.0, 0.0, atan2(-py, -px))
+        self.action_last = self.action_last_list[0]
         
+        if self.digit_env is not None and self.robot_num > 1:
+            self.digit_env.set_second_robot_target(
+                np.array([self.robots[1].px, self.robots[1].py, self.robots[1].theta], dtype=np.float32))
+
         if self.digit_env is not None:    
             # for initializing
-            self.digit_env.reset(robot=np.array([self.robot.px, self.robot.py], dtype=np.float32))
+            self.digit_env.reset(robot=np.array([self.robots[0].px, self.robots[0].py], dtype=np.float32))
             sleep(self.digit_env.cfg.control.control_dt)
             # initialize the locomotion for 2 seconds to let the robot step in place
             initial_time = np.random.uniform(2.0, 2.0 + self.time_step + self.digit_env.cfg.control.control_dt)
@@ -604,9 +708,10 @@ class CrowdSim:
             robot_y = self.digit_env.root_xy_pos[1]
             robot_theta = self.digit_env.root_rpy[2] 
             # update states
-            self.robot.update_states(robot_x, robot_y, robot_theta, np.zeros(2), differential=True)
+            self.robots[0].update_states(robot_x, robot_y, robot_theta, np.zeros(2), differential=True)
         
-        self.goal_distance_last = self.robot.get_goal_distance()
+        self.goal_distance_last_list = [robot.get_goal_distance() for robot in self.robots]
+        self.goal_distance_last = self.goal_distance_last_list[0]
 
         # 3,5 save
         # np.random.seed(5)
@@ -614,29 +719,20 @@ class CrowdSim:
             np.random.seed(seed)
         self.generate_random_static_obstacle()
         self.generate_random_human_position()
+        self._sync_mujoco_agents()
 
-        self.get_frame() 
-        
-        for _ in range(self.frame_stack):
-            self.frames.append(self.single_frame)
-        assert len(self.frames) == self.frame_stack
-        lidar_image = np.concatenate(list(self.frames), axis=0)
-
-        # get the observation
-
-        dx = self.robot.gx - self.robot.px
-        dy = self.robot.gy - self.robot.py
-        theta = self.robot.theta
-        y_rel = dy * cos(theta) - dx * sin(theta)
-        x_rel = dy * sin(theta) + dx * cos(theta)
-        r = hypot(x_rel, y_rel)
-        t = atan2(y_rel, x_rel)
-        
-        emotion_values = np.array([h.emotion_value for h in self.humans], dtype=np.float32)
-        robot_goal_emotion_state = np.array([r / self.square_width, t / np.pi, 
-                                             self.action_last[0] / self.action_range[1, 0],
-                                             self.action_last[1] / self.action_range[1, 1],
-                                             emotion_values.mean(), emotion_values.max()], dtype=np.float32)
+        # per-robot frames and observations
+        self.frames_list = [deque([], maxlen=self.frame_stack) for _ in range(self.robot_num)]
+        self.frames = self.frames_list[0]
+        lidar_images = []
+        robot_goal_emotion_states = []
+        for j in range(self.robot_num):
+            frame = self.get_frame(j)
+            for _ in range(self.frame_stack):
+                self.frames_list[j].append(frame)
+            assert len(self.frames_list[j]) == self.frame_stack
+            lidar_images.append(np.concatenate(list(self.frames_list[j]), axis=0))
+            robot_goal_emotion_states.append(self._get_robot_goal_emotion_state(j))
        
         if save_data:
             all_obstacles = np.zeros((self.human_num + self.static_obstacle_num, 2), dtype=np.float32)
@@ -667,7 +763,24 @@ class CrowdSim:
                 lasers[i] = np.array([laser[0][0], laser[0][1], laser[1][0], laser[1][1]], dtype=np.float32)
             self.log_env['laser'][self.global_step] = lasers
        
-        return lidar_image, robot_goal_emotion_state
+        return lidar_images, robot_goal_emotion_states
+
+    def _get_robot_goal_emotion_state(self, robot_idx=0):
+        robot = self.robots[robot_idx]
+        dx = robot.gx - robot.px
+        dy = robot.gy - robot.py
+        theta = robot.theta
+        y_rel = dy * cos(theta) - dx * sin(theta)
+        x_rel = dy * sin(theta) + dx * cos(theta)
+        r = hypot(x_rel, y_rel)
+        t = atan2(y_rel, x_rel)
+
+        emotion_values = np.array([h.emotion_value for h in self.humans], dtype=np.float32)
+        action_last = self.action_last_list[robot_idx]
+        return np.array([r / self.square_width, t / np.pi, 
+                         action_last[0] / self.action_range[1, 0],
+                         action_last[1] / self.action_range[1, 1],
+                         emotion_values.mean(), emotion_values.max()], dtype=np.float32)
 
     def render(self, mode='laser'):
         if mode == 'laser':

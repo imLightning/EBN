@@ -46,6 +46,33 @@ class DigitEnvFlat(DigitEnvBase, utils.EzPickle):
 
         # defualt geom friction
         self.default_geom_friction = self.model.geom_friction.copy()
+        # number of visualization-only pedestrian/obstacle bodies in the scene
+        self.pedestrian_body_num = 0
+        while mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'pedestrian_%d' % self.pedestrian_body_num) >= 0:
+            self.pedestrian_body_num += 1
+        self.obstacle_body_num = 0
+        while mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'obstacle_%d' % self.obstacle_body_num) >= 0:
+            self.obstacle_body_num += 1
+        # number of placeholder bodies for the other robots (robot 0 is the digit)
+        self.robot_placeholder_num = 0
+        while mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'robot_%d' % (self.robot_placeholder_num + 1)) >= 0:
+            self.robot_placeholder_num += 1
+        # the second-robot ghost: a visual copy of the digit subtree (r2_*)
+        self.second_robot_target = None
+        self.r2_qpos_adr = -1
+        self.r2_qpos_len = 0
+        self.r2_qvel_adr = -1
+        self.r2_qvel_len = 0
+        jnt = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, 'r2_base')
+        if jnt >= 0:
+            self.r2_qpos_adr = self.model.jnt_qposadr[jnt]
+            self.r2_qpos_len = self.model.nq - self.r2_qpos_adr
+            self.r2_qvel_adr = self.model.jnt_dofadr[jnt]
+            self.r2_qvel_len = self.model.nv - self.r2_qvel_adr
+        # number of goal markers ('goal' is robot 0's fixed goal, then goal_1..)
+        self.goal_body_num = 1
+        while mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'goal_%d' % (self.goal_body_num)) >= 0:
+            self.goal_body_num += 1
         # pickling
         kwargs = {"cfg": self.cfg, "log_dir": self.log_dir,}
         utils.EzPickle.__init__(self, **kwargs)

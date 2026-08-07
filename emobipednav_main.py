@@ -20,9 +20,12 @@ from digit_mujoco.envs.digit.digit_env_flat import DigitEnvFlat
 
 # Runs policy for X episodes and returns average reward
 # A fixed seed is used for the eval environment
-def eval_policy(policy, eval_or_test_env, current_steps, 
+def eval_policy(policy_list, eval_or_test_env, current_steps, 
                 eval_episodes=100, save_directory=None, 
-                if_save_video=False, final_test=False):
+                if_save_video=False, final_test=False, visualizer=None):
+    if not isinstance(policy_list, (list, tuple)):
+        policy_list = [policy_list]
+    robot_num = eval_or_test_env.robot_num
     avg_reward = 0.
     success_times = []
     collision_times = []
@@ -39,49 +42,58 @@ def eval_policy(policy, eval_or_test_env, current_steps,
         if_save_data = (i < 10 or final_test)
         if final_test:
             if eval_episodes == 1:
-                # please set your own seed to randomize a specific
-                lidar_image, robot_goal_emotion_state  = eval_or_test_env.reset(seed=seed_specific, save_data=if_save_data)
+                lidar_images, robot_goal_emotion_states = eval_or_test_env.reset(seed=seed_specific, save_data=if_save_data)
             else:
-                lidar_image, robot_goal_emotion_state  = eval_or_test_env.reset(seed=i, save_data=if_save_data)
+                lidar_images, robot_goal_emotion_states = eval_or_test_env.reset(seed=i, save_data=if_save_data)
         else:
-            lidar_image, robot_goal_emotion_state  = eval_or_test_env.reset(save_data=if_save_data)
+            lidar_images, robot_goal_emotion_states = eval_or_test_env.reset(save_data=if_save_data)
+        if visualizer is not None:
+            visualizer.update()
         # eval_or_test_env.render()
         # time.sleep(0.2)
         done = False
         ep_step = 0
+        episode_info = [Nothing() for _ in range(robot_num)]
         
         while ep_step < eval_or_test_env.max_episode_step:
             # t1 = time.time()
-            with eval_policy_mode(policy):
-                action = policy.select_action(lidar_image, robot_goal_emotion_state)
+            actions = []
+            with eval_policy_mode(*policy_list):
+                for j in range(robot_num):
+                    actions.append(policy_list[j].select_action(lidar_images[j], robot_goal_emotion_states[j]))
             # action = eval_or_test_env.dwa_compute_action()
-            lidar_image, robot_goal_emotion_state, reward, done, info = eval_or_test_env.step(action, eval=True, save_data=if_save_data)
+            lidar_images, robot_goal_emotion_states, rewards, dones, info_list = eval_or_test_env.step(actions, eval=True, save_data=if_save_data)
+            if visualizer is not None:
+                visualizer.update()
             # print('time: ', time.time() - t1) # 7.5ms
             # eval_or_test_env.render()
             # time.sleep(0.2)
-            avg_reward += reward
+            avg_reward += sum(rewards)
             ep_step = ep_step + 1
-            if done or ep_step == eval_or_test_env.max_episode_step or isinstance(info, ReachGoal):
+            episode_info = info_list
+            any_collision = any(isinstance(info, Collision) for info in info_list)
+            all_reach = all(isinstance(info, ReachGoal) for info in info_list)
+            if any_collision or all_reach or ep_step == eval_or_test_env.max_episode_step:
                 if ep_step == eval_or_test_env.max_episode_step:
                     timeout += 1
                     timeout_cases.append(i)
                     timeout_times.append(eval_or_test_env.time_limit)
                     print('evaluation episode ' + str(i) + ', time out: ' + str(ep_step))
                 else:
-                    if isinstance(info, ReachGoal):
-                        success += 1
-                        success_times.append(eval_or_test_env.global_time)
-                        print('evaluation episode ' + str(i) + ', goal reaching at evaluation step: ' + str(ep_step))
-                    elif isinstance(info, Collision):
+                    if any_collision:
                         collision += 1
                         collision_cases.append(i)
                         collision_times.append(eval_or_test_env.global_time)
                         print('evaluation episode ' + str(i) + ', collision occur at evaluation step: ' + str(ep_step))           
+                    elif all_reach:
+                        success += 1
+                        success_times.append(eval_or_test_env.global_time)
+                        print('evaluation episode ' + str(i) + ', goal reaching at evaluation step: ' + str(ep_step))
                     else:
                         raise ValueError('Invalid end signal from environment')
                 break
         if save_directory is not None:
-            if not isinstance(info, ReachGoal):
+            if not isinstance(episode_info[0], ReachGoal):
                 if eval_episodes == 1:
                     file_name = save_directory + '/eval_' + str(seed_specific) + '_' + str(i) + '_fail' + '.npz'
                 else:
@@ -97,7 +109,12 @@ def eval_policy(policy, eval_or_test_env, current_steps,
                 if eval_episodes == 1:
                     digit_qpos_arr = np.array(eval_or_test_env.digit_qpos)
                     np.save(file_name_digit, digit_qpos_arr)
-             
+            # write the accumulated mujoco frames into video and release the memory
+            if if_save_video and eval_or_test_env.digit_env is not None:
+                if eval_episodes == 1:
+                    eval_or_test_env.save_video(seed_specific, i)
+                else:
+                    eval_or_test_env.save_video(current_steps, i)
 
     success_rate = success / eval_episodes
     collision_rate = collision / eval_episodes
@@ -128,11 +145,13 @@ def main():
     # How often (time steps) we evaluate
     parser.add_argument('--eval_freq', default=20000, type=int)
     # How often (time steps) we save the trained model
-    parser.add_argument('--save_model_freq', default=200000, type=int)
+    parser.add_argument('--save_model_freq', default=20000, type=int)
     # Max time steps to run environment
     parser.add_argument('--max_timesteps', default=6e6, type=int)
-    # replay buffer
-    parser.add_argument("--replay_buffer_capacity", default=160000, type=int)
+    # replay buffer, capacity per agent (keep it small to fit in RAM)
+    parser.add_argument("--replay_buffer_capacity", default=30000, type=int)
+    # number of robots sharing the same crowd environment (multi-agent)
+    parser.add_argument("--robot_num", default=2, type=int)
     
     # training
     parser.add_argument('--batch_size', default=128, type=int)
@@ -191,6 +210,10 @@ def main():
     parser.add_argument("--human_num_max", type=int, default=4)
     parser.add_argument("--static_obstacle_num_max", type=int, default=3)
     parser.add_argument("--square_width", type=float, default=10.0)
+    # live 3D view of all robots, pedestrians and obstacles during eval/test
+    parser.add_argument('--visualize_3d', action='store_true', default=False)
+    # render the 3D scene every N training steps (only when --visualize_3d)
+    parser.add_argument('--visualize_3d_freq', type=int, default=5)
     args = parser.parse_args()
 
     print("---------------------------------------")
@@ -259,12 +282,15 @@ def main():
     
     if args.robot_eval_model == 'digit_mujoco':
         cfg_digit_env_eval = DigitEnvConfig()
-        cfg_digit_env_eval.vis_record.visualize = True
-        cfg_digit_env_eval.vis_record.record = True
+        # periodic training evaluations do NOT record video: no offscreen viewer,
+        # no frame accumulation, no mp4 writing (faster training). Video is only
+        # recorded in the --load_test_model test mode via test_env below.
+        cfg_digit_env_eval.vis_record.visualize = False
+        cfg_digit_env_eval.vis_record.record = False
         digit_env_eval = DigitEnvFlat(cfg_digit_env_eval, file_evaluation_episodes)
         
         eval_env = CrowdSim(args, action_range, action_choices=action_choices, digit_env=digit_env_eval)
-        if_save_video = True
+        if_save_video = False
     elif args.robot_eval_model == 'lip':
         eval_env = CrowdSim(args, action_range, action_choices=action_choices)
         if_save_video = False
@@ -290,6 +316,14 @@ def main():
         test_env = CrowdSim(args, action_range, action_choices=action_choices)
     else:
         raise NotImplementedError(args.robot_test_model)
+
+    visualizer = None
+    if args.visualize_3d:
+        from visualize_3d import Visualizer3D
+        # a single window bound to the train env; it is re-pointed to the
+        # eval/test env during evaluations
+        visualizer = Visualizer3D(env)
+
     # please manually set seeds when test with digit_arsim
     # otherwise, set it as args.seed
     # set_seed_everywhere(args.seed)
@@ -299,75 +333,100 @@ def main():
     obs_shape = (args.frame_stack, args.image_size, args.image_size)
     robot_goal_state_dim = args.robot_goal_state_dim
     action_shape = (2,)
-    agent = SacAeAgent(
-            obs_shape,
-            robot_goal_state_dim,
-            action_shape,
-            action_range,
-            device,
-            hidden_dim=args.hidden_dim,
-            discount=args.discount,
-            init_temperature=args.init_temperature,
-            alpha_lr=args.alpha_lr,
-            alpha_beta=args.alpha_beta,
-            actor_lr=args.actor_lr,
-            actor_beta=args.actor_beta,
-            actor_log_std_min=args.actor_log_std_min,
-            actor_log_std_max=args.actor_log_std_max,
-            actor_update_freq=args.actor_update_freq,
-            critic_lr=args.critic_lr,
-            critic_beta=args.critic_beta,
-            critic_tau=args.critic_tau,
-            critic_target_update_freq=args.critic_target_update_freq,
-            encoder_type=args.encoder_type,
-            encoder_feature_dim=args.encoder_feature_dim,
-            encoder_lr=args.encoder_lr,
-            encoder_tau=args.encoder_tau,
-            decoder_type=args.decoder_type,
-            decoder_lr=args.decoder_lr,
-            decoder_update_freq=args.decoder_update_freq,
-            decoder_latent_lambda=args.decoder_latent_lambda,
-            decoder_weight_lambda=args.decoder_weight_lambda,
-            num_layers=args.num_layers,
-            num_filters=args.num_filters
-        )
+    agents = []
+    for _ in range(args.robot_num):
+        agent = SacAeAgent(
+                obs_shape,
+                robot_goal_state_dim,
+                action_shape,
+                action_range,
+                device,
+                hidden_dim=args.hidden_dim,
+                discount=args.discount,
+                init_temperature=args.init_temperature,
+                alpha_lr=args.alpha_lr,
+                alpha_beta=args.alpha_beta,
+                actor_lr=args.actor_lr,
+                actor_beta=args.actor_beta,
+                actor_log_std_min=args.actor_log_std_min,
+                actor_log_std_max=args.actor_log_std_max,
+                actor_update_freq=args.actor_update_freq,
+                critic_lr=args.critic_lr,
+                critic_beta=args.critic_beta,
+                critic_tau=args.critic_tau,
+                critic_target_update_freq=args.critic_target_update_freq,
+                encoder_type=args.encoder_type,
+                encoder_feature_dim=args.encoder_feature_dim,
+                encoder_lr=args.encoder_lr,
+                encoder_tau=args.encoder_tau,
+                decoder_type=args.decoder_type,
+                decoder_lr=args.decoder_lr,
+                decoder_update_freq=args.decoder_update_freq,
+                decoder_latent_lambda=args.decoder_latent_lambda,
+                decoder_weight_lambda=args.decoder_weight_lambda,
+                num_layers=args.num_layers,
+                num_filters=args.num_filters
+            )
+        agents.append(agent)
     
-    replay_buffer = ReplayBuffer(
-        obs_shape,
-        robot_goal_state_dim, 
-        action_shape,
-        capacity=args.replay_buffer_capacity,
-        batch_size=args.batch_size,
-        device=device
-    )
+    replay_buffers = []
+    for _ in range(args.robot_num):
+        replay_buffers.append(ReplayBuffer(
+            obs_shape,
+            robot_goal_state_dim, 
+            action_shape,
+            capacity=args.replay_buffer_capacity,
+            batch_size=args.batch_size,
+            device=device
+        ))
 
     checkpoint_steps = 0
     if args.load_model != "":
-        # replay_buffer.load(file_buffer)
-        agent.load(file_models + '/' + args.load_model)
+        for j, agent in enumerate(agents):
+            load_name = file_models + '/' + args.load_model
+            if args.robot_num > 1:
+                try:
+                    agent.load(load_name + '_robot_' + str(j))
+                    continue
+                except Exception:
+                    pass
+            agent.load(load_name)
         # args.load_model, format, step_NO_success_NO
         # extract the first number
         checkpoint_steps = int(args.load_model.split('_')[1])
 
     if args.load_test_model != "":
         print('start to test')
-        agent.load(file_models + '/' + args.load_test_model)
+        for j, agent in enumerate(agents):
+            load_name = file_models + '/' + args.load_test_model
+            if args.robot_num > 1:
+                try:
+                    agent.load(load_name + '_robot_' + str(j))
+                    continue
+                except Exception:
+                    pass
+            agent.load(load_name)
         if args.test_single:
             test_times = 1
             current_step = 9999
         else:
             test_times = 500
             current_step = 0
-        success_rate, collision_rate, avg_nav_time = eval_policy(agent, test_env, current_step, 
+        if visualizer is not None:
+            visualizer.env = test_env
+        success_rate, collision_rate, avg_nav_time = eval_policy(agents, test_env, current_step, 
                                                                  eval_episodes=test_times, save_directory=file_final_test_episodes, 
-                                                                 if_save_video=if_save_video_test, final_test=True)
+                                                                 if_save_video=if_save_video_test, final_test=True,
+                                                                 visualizer=visualizer)
         print('success_rate, collision_rate, avg_nav_time')
         print(success_rate, collision_rate, avg_nav_time)
         return
 
     evaluations = []
 
-    lidar_image, robot_goal_emotion_state = env.reset()
+    lidar_images, robot_goal_emotion_states = env.reset()
+    if visualizer is not None:
+        visualizer.update()
     done = False
     episode_reward = 0
     episode_timesteps = 0
@@ -378,48 +437,64 @@ def main():
             print('replay buffer has been initialized')
         # Perform action
         # sample action for data collection
+        actions = []
         if t < args.start_timesteps:
-            action = np.random.uniform(action_range[0], action_range[1])
+            for j in range(args.robot_num):
+                actions.append(np.random.uniform(action_range[0], action_range[1]))
         else:
-            with eval_policy_mode(agent):
-                action = agent.sample_action(lidar_image, robot_goal_emotion_state)
-        next_lidar_image, next_robot_goal_emotion_state, reward, done, info = env.step(action)
+            with eval_policy_mode(*agents):
+                for j in range(args.robot_num):
+                    actions.append(agents[j].sample_action(lidar_images[j], robot_goal_emotion_states[j]))
+        next_lidar_images, next_robot_goal_emotion_states, rewards, dones, info_list = env.step(actions)
 
         episode_timesteps += 1
 
         if episode_timesteps == env.max_episode_step:
             done_bool = 0.0
         else:
-            done_bool = float(done)
+            any_collision = any(isinstance(info, Collision) for info in info_list)
+            all_reach = all(isinstance(info, ReachGoal) for info in info_list)
+            done_bool = 1.0 if (any_collision or all_reach) else 0.0
 
-        # Store data in replay buffer
-        replay_buffer.add(
-            lidar_image, robot_goal_emotion_state, action, reward, next_lidar_image, next_robot_goal_emotion_state, done_bool)
+        # Store data in replay buffers
+        for j in range(args.robot_num):
+            replay_buffers[j].add(
+                lidar_images[j], robot_goal_emotion_states[j], actions[j], rewards[j],
+                next_lidar_images[j], next_robot_goal_emotion_states[j], done_bool)
 
-        lidar_image = next_lidar_image
-        robot_goal_emotion_state = next_robot_goal_emotion_state
-        episode_reward += reward
+        lidar_images = next_lidar_images
+        robot_goal_emotion_states = next_robot_goal_emotion_states
+        episode_reward += sum(rewards)
 
-        # Train agent after collecting sufficient data
+        # Train agents after collecting sufficient data
         if t >= args.start_timesteps:
             num_updates = args.start_timesteps if t == args.start_timesteps else 1
-            for _ in range(num_updates):
-                agent.update(replay_buffer, writer, t)
+            for j in range(args.robot_num):
+                for _ in range(num_updates):
+                    agents[j].update(replay_buffers[j], writer, t)
 
-        if done or episode_timesteps == env.max_episode_step or isinstance(info, ReachGoal):
+        # live 3D view during training
+        if visualizer is not None and t % args.visualize_3d_freq == 0:
+            visualizer.update()
+
+        any_collision = any(isinstance(info, Collision) for info in info_list)
+        all_reach = all(isinstance(info, ReachGoal) for info in info_list)
+        if any_collision or all_reach or episode_timesteps == env.max_episode_step:
             if episode_timesteps == env.max_episode_step:
                 print('total step ' + str(t) + ', train episode ' + str(episode_num+1) + ', time out: ' + str(episode_timesteps))
             else:
-                if isinstance(info, ReachGoal):
-                    print('total step ' + str(t) + ', train episode ' + str(episode_num+1) + 
-                        ', goal reaching at train step: ' + str(episode_timesteps))
-                elif isinstance(info, Collision):
+                if any_collision:
                     print('total step ' + str(t) + ', train episode ' + str(episode_num+1) + 
                         ', collision occur at train step: ' + str(episode_timesteps))     
+                elif all_reach:
+                    print('total step ' + str(t) + ', train episode ' + str(episode_num+1) + 
+                        ', goal reaching at train step: ' + str(episode_timesteps))
                 else:
                     raise ValueError('Invalid end signal from environment')
             # Reset environment
-            lidar_image, robot_goal_emotion_state = env.reset()
+            lidar_images, robot_goal_emotion_states = env.reset()
+            if visualizer is not None:
+                visualizer.update()
             done = False
             episode_num += 1
             writer.add_scalar('train/episode_reward', episode_reward, episode_num)
@@ -428,9 +503,12 @@ def main():
 
         # Evaluate episode
         if t % args.eval_freq == 0:
-            success_rate, collision_rate, avg_nav_time = eval_policy(agent, eval_env, t, 
+            if visualizer is not None:
+                visualizer.env = eval_env
+            success_rate, collision_rate, avg_nav_time = eval_policy(agents, eval_env, t, 
                                                                      save_directory=file_evaluation_episodes, 
-                                                                     if_save_video=if_save_video)
+                                                                     if_save_video=if_save_video,
+                                                                     visualizer=visualizer)
             file_name = '/step_' + str(t) + '_success_' + str(int(success_rate * 100))
             print('success_rate, collision_rate, avg_nav_time at step ' + str(t))
             print(success_rate, collision_rate, avg_nav_time)
@@ -439,13 +517,20 @@ def main():
             evaluations.append(success_rate)
             np.savetxt(file_results + file_name + '.txt', evaluations)
             if success_rate > 0.85 or t % args.save_model_freq == 0:
-                agent.save(file_models + file_name)
+                for j, agent in enumerate(agents):
+                    if args.robot_num > 1:
+                        agent.save(file_models + file_name + '_robot_' + str(j))
+                    else:
+                        agent.save(file_models + file_name)
                 # replay_buffer.save(file_buffer)
-         
+     
     print('final test')
-    success_rate, collision_rate, avg_nav_time = eval_policy(agent, eval_env, t, 
+    if visualizer is not None:
+        visualizer.env = eval_env
+    success_rate, collision_rate, avg_nav_time = eval_policy(agents, eval_env, t, 
                                                              eval_episodes=500, save_directory=file_final_test_episodes,
-                                                             if_save_video=if_save_video, final_test=True)
+                                                             if_save_video=if_save_video, final_test=True,
+                                                             visualizer=visualizer)
     print('success_rate, collision_rate, avg_nav_time')
     print(success_rate, collision_rate, avg_nav_time)
 

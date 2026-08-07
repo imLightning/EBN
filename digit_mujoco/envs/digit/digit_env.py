@@ -115,6 +115,10 @@ class DigitEnvBase:
         # observe for next step
         self._get_obs() # call _reset_state before this.
 
+        # place the second-robot ghost at its target immediately (or hide it for
+        # single-robot runs), so the first recorded frame is already correct
+        self._sync_second_robot()
+
         # start rendering              
         if self.viewer is not None and self.cfg.vis_record.visualize:
             frame = self.render()
@@ -184,11 +188,118 @@ class DigitEnvBase:
                 }
     
     def set_obstacles(self, obstacles):
+        # obstacles: (M, 3) array of [px, py, radius].
+        # Move the static obstacle (table) bodies for visualization only (the
+        # geoms have contype/conaffinity = 0, so they do not affect physics).
         for i in range(obstacles.shape[0]):
-            self.data.qpos[61+i*7] = obstacles[i][0]
-            self.data.qpos[61+i*7+1] = obstacles[i][1]
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'obstacle_%d' % i)
+            if bid < 0:
+                continue
+            self.model.body_pos[bid, 0] = obstacles[i, 0]
+            self.model.body_pos[bid, 1] = obstacles[i, 1]
+            self.model.body_pos[bid, 2] = 0.0
+            radius = obstacles[i, 2]
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'obstacle_%d_top' % i)
+            if gid >= 0:
+                self.model.geom_size[gid, 0] = radius
+                self.model.geom_size[gid, 1] = radius
+            for k in range(1, 5):
+                lgid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'obstacle_%d_leg%d' % (i, k))
+                if lgid >= 0:
+                    sx = 1.0 if k in (2, 4) else -1.0
+                    sy = 1.0 if k in (3, 4) else -1.0
+                    self.model.geom_pos[lgid, 0] = sx * (radius - 0.04)
+                    self.model.geom_pos[lgid, 1] = sy * (radius - 0.04)
+        for i in range(obstacles.shape[0], self.obstacle_body_num):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'obstacle_%d' % i)
+            if bid >= 0:
+                self.model.body_pos[bid, 1] = 1.0e4
         mujoco.mj_forward(self.model, self.data)
-    
+
+    def set_pedestrians(self, pedestrians):
+        # pedestrians: (N, 5) array of [px, py, radius, emotion, layer_radius].
+        # Move and color the pedestrian bodies for visualization only. The body
+        # and head color reflect the emotion (blue = calm, red = high emotion)
+        # and the transparent disc shows the discomfort zone.
+        for i in range(pedestrians.shape[0]):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'pedestrian_%d' % i)
+            if bid < 0:
+                continue
+            self.model.body_pos[bid, 0] = pedestrians[i, 0]
+            self.model.body_pos[bid, 1] = pedestrians[i, 1]
+            self.model.body_pos[bid, 2] = 0.0
+            emotion = float(pedestrians[i, 3])
+            rgba = [min(1.0, emotion + 0.3), 0.4, max(0.0, 1.0 - emotion), 1.0]
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'pedestrian_%d_geom' % i)
+            if gid >= 0:
+                self.model.geom_rgba[gid] = rgba
+            hgid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'pedestrian_%d_head' % i)
+            if hgid >= 0:
+                self.model.geom_rgba[hgid] = rgba
+            lgid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'pedestrian_%d_layer' % i)
+            if lgid >= 0:
+                self.model.geom_size[lgid, 0] = pedestrians[i, 4]
+        for i in range(pedestrians.shape[0], self.pedestrian_body_num):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'pedestrian_%d' % i)
+            if bid >= 0:
+                self.model.body_pos[bid, 1] = 1.0e4
+        mujoco.mj_forward(self.model, self.data)
+
+    def set_second_robot_target(self, pos):
+        """pos: (px, py, theta) of the second robot; the ghost Digit is drawn there."""
+        self.second_robot_target = pos
+
+    def set_robot_goals(self, goals):
+        """goals: (M, 2) array of [gx, gy] for robots[1:]; move the goal markers."""
+        for i in range(goals.shape[0]):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'goal_%d' % (i + 1))
+            if bid < 0:
+                continue
+            self.model.body_pos[bid, 0] = goals[i, 0]
+            self.model.body_pos[bid, 1] = goals[i, 1]
+        for i in range(goals.shape[0], self.goal_body_num - 1):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'goal_%d' % (i + 1))
+            if bid >= 0:
+                self.model.body_pos[bid, 1] = 1.0e4
+        mujoco.mj_forward(self.model, self.data)
+
+    def _sync_second_robot(self):
+        """Copy robot 0's current joint configuration into the second Digit ghost
+        and place it at the second robot's position/orientation. When no target
+        is set (single-robot runs) the ghost is moved far away so it is hidden."""
+        if self.r2_qpos_adr < 0:
+            return
+        adr = self.r2_qpos_adr
+        n = self.r2_qpos_len
+        q = self.data.qpos
+        if self.second_robot_target is None:
+            q[adr + 0] = 0.0
+            q[adr + 1] = 1.0e4
+            q[adr + 2] = 1.0
+            q[adr + 3] = 1.0
+            q[adr + 4] = 0.0
+            q[adr + 5] = 0.0
+            q[adr + 6] = 0.0
+            if self.r2_qvel_len > 0:
+                self.data.qvel[self.r2_qvel_adr:self.r2_qvel_adr + self.r2_qvel_len] = 0.0
+            mujoco.mj_forward(self.model, self.data)
+            return
+        # copy robot 0's root + joints into the ghost (identical subtree layout)
+        np.copyto(q[adr:adr + n], q[:n])
+        # place the ghost at the second robot
+        t = self.second_robot_target
+        yaw = float(t[2])
+        q[adr + 0] = t[0]
+        q[adr + 1] = t[1]
+        q[adr + 2] = q[2]
+        q[adr + 3] = float(np.cos(yaw / 2.0))
+        q[adr + 4] = 0.0
+        q[adr + 5] = 0.0
+        q[adr + 6] = float(np.sin(yaw / 2.0))
+        if self.r2_qvel_len > 0:
+            self.data.qvel[self.r2_qvel_adr:self.r2_qvel_adr + self.r2_qvel_len] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+
     def get_eps_info(self):
         """
         return current environment's info.
@@ -251,6 +362,10 @@ class DigitEnvBase:
 
         # TODO: debug reward function
         rewards, tot_reward = self._compute_reward()
+
+        # re-anchor the second-robot ghost to robot 0's current pose at its own
+        # position, so the recorded frames show a second walking Digit
+        self._sync_second_robot()
 
         # visualize
         if self.viewer is not None and self.step_cnt % self.record_interval == 0 and self.cfg.vis_record.visualize and self.step_cnt:
