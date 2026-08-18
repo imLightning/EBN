@@ -210,7 +210,7 @@ class SacAeAgent(object):
         # tie encoders between actor and critic
         self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
 
-        self.log_alpha = torch.tensor(np.log(init_temperature)).to(device)
+        self.log_alpha = torch.tensor(np.log(init_temperature), dtype=torch.float32).to(device)
         self.log_alpha.requires_grad = True
         # set target entropy to -|A|
         self.target_entropy = -np.prod(action_shape)

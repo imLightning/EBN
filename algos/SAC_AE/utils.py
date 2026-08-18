@@ -56,6 +56,55 @@ def preprocess_obs(obs, bits=5):
     return obs
 
 
+class MultiAgentReplayBuffer(object):
+    """Replay buffer storing synchronized transitions of all agents (CTDE)."""
+    def __init__(self, num_agents, obs_shape, robot_goal_state_dim, action_shape,
+                 capacity=200000, batch_size=32, device='cuda', obs_dtype=np.uint8):
+        self.num_agents = num_agents
+        self.capacity = capacity
+        self.batch_size = batch_size
+        self.device = device
+
+        self.obses = [np.empty((capacity, *obs_shape), dtype=obs_dtype) for _ in range(num_agents)]
+        self.robot_goal_emotion_states = [np.empty((capacity, robot_goal_state_dim), dtype=np.float32) for _ in range(num_agents)]
+        self.next_obses = [np.empty((capacity, *obs_shape), dtype=obs_dtype) for _ in range(num_agents)]
+        self.next_robot_goal_emotion_states = [np.empty((capacity, robot_goal_state_dim), dtype=np.float32) for _ in range(num_agents)]
+        self.actions = [np.empty((capacity, *action_shape), dtype=np.float32) for _ in range(num_agents)]
+        self.rewards = np.empty((capacity, num_agents), dtype=np.float32)
+        self.not_dones = np.empty((capacity, num_agents), dtype=np.float32)
+
+        self.idx = 0
+        self.last_save = 0
+        self.full = False
+
+    def add(self, obs_list, state_list, action_list, reward_list, done_list,
+            next_obs_list, next_state_list):
+        for i in range(self.num_agents):
+            np.copyto(self.obses[i][self.idx], obs_list[i])
+            np.copyto(self.robot_goal_emotion_states[i][self.idx], state_list[i])
+            np.copyto(self.actions[i][self.idx], action_list[i])
+            np.copyto(self.next_obses[i][self.idx], next_obs_list[i])
+            np.copyto(self.next_robot_goal_emotion_states[i][self.idx], next_state_list[i])
+        self.rewards[self.idx] = np.asarray(reward_list, dtype=np.float32)
+        self.not_dones[self.idx] = 1.0 - np.asarray(done_list, dtype=np.float32)
+
+        self.idx = (self.idx + 1) % self.capacity
+        self.full = self.full or self.idx == 0
+
+    def sample(self):
+        idxs = np.random.randint(
+            0, self.capacity if self.full else self.idx, size=self.batch_size
+        )
+        obs_list = [torch.as_tensor(self.obses[i][idxs], device=self.device).float() for i in range(self.num_agents)]
+        state_list = [torch.as_tensor(self.robot_goal_emotion_states[i][idxs], device=self.device) for i in range(self.num_agents)]
+        action_list = [torch.as_tensor(self.actions[i][idxs], device=self.device) for i in range(self.num_agents)]
+        next_obs_list = [torch.as_tensor(self.next_obses[i][idxs], device=self.device).float() for i in range(self.num_agents)]
+        next_state_list = [torch.as_tensor(self.next_robot_goal_emotion_states[i][idxs], device=self.device) for i in range(self.num_agents)]
+        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
+        not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
+        return obs_list, state_list, action_list, rewards, next_obs_list, next_state_list, not_dones
+
+
 class ReplayBuffer(object):
     """Buffer to store environment transitions."""
     def __init__(self, obs_shape, robot_goal_state_dim, action_shape, 

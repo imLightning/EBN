@@ -2,6 +2,8 @@ import argparse
 import numpy as np
 import random
 import os
+import sys
+import signal
 import torch
 import time
 
@@ -18,11 +20,24 @@ import time
 from digit_mujoco.cfg.digit_env_config import DigitEnvConfig
 from digit_mujoco.envs.digit.digit_env_flat import DigitEnvFlat
 
+# Ctrl+C handling: a module-level flag is set by the SIGINT handler and checked
+# at step/episode boundaries so training exits cleanly and saves the model
+_INTERRUPTED = False
+
+
+def _sigint_handler(sig, frame):
+    global _INTERRUPTED
+    _INTERRUPTED = True
+
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
 # Runs policy for X episodes and returns average reward
 # A fixed seed is used for the eval environment
 def eval_policy(policy_list, eval_or_test_env, current_steps, 
                 eval_episodes=100, save_directory=None, 
-                if_save_video=False, final_test=False, visualizer=None):
+                if_save_video=False, final_test=False, visualizer=None,
+                arbitrator=None):
     if not isinstance(policy_list, (list, tuple)):
         policy_list = [policy_list]
     robot_num = eval_or_test_env.robot_num
@@ -39,6 +54,8 @@ def eval_policy(policy_list, eval_or_test_env, current_steps,
     seed_all = [23, 24, 37, 38, 42, 47, 49, 59, 61]
     seed_specific = seed_all[0]
     for i in range(eval_episodes):
+        if _INTERRUPTED:
+            break
         if_save_data = (i < 10 or final_test)
         if final_test:
             if eval_episodes == 1:
@@ -61,6 +78,9 @@ def eval_policy(policy_list, eval_or_test_env, current_steps,
             with eval_policy_mode(*policy_list):
                 for j in range(robot_num):
                     actions.append(policy_list[j].select_action(lidar_images[j], robot_goal_emotion_states[j]))
+            # high-level LLM/rule arbitration modulates the yielding robot's speed
+            if arbitrator is not None:
+                actions, _ = arbitrator.apply(actions)
             # action = eval_or_test_env.dwa_compute_action()
             lidar_images, robot_goal_emotion_states, rewards, dones, info_list = eval_or_test_env.step(actions, eval=True, save_data=if_save_data)
             if visualizer is not None:
@@ -121,8 +141,22 @@ def eval_policy(policy_list, eval_or_test_env, current_steps,
     assert success + collision + timeout == eval_episodes
     avg_nav_time = sum(success_times) / len(success_times) if success_times else eval_or_test_env.time_limit
 
-    
+    if arbitrator is not None and save_directory is not None:
+        arbitrator.save_reasons(save_directory)
+
     return success_rate, collision_rate, avg_nav_time
+
+
+def save_checkpoint(agents, centralized_critic, file_models, file_name, robot_num):
+    """Save all agents (and the CTDE centralized critic when used) to file_models."""
+    for j, agent in enumerate(agents):
+        if robot_num > 1:
+            agent.save(file_models + file_name + '_robot_' + str(j))
+        else:
+            agent.save(file_models + file_name)
+    if centralized_critic is not None:
+        torch.save(centralized_critic.state_dict(),
+                   file_models + file_name + '_centralized_critic')
 
 
 def main():
@@ -143,15 +177,34 @@ def main():
     # Time steps initial random policy is used
     parser.add_argument('--start_timesteps', default=10000, type=int)
     # How often (time steps) we evaluate
-    parser.add_argument('--eval_freq', default=20000, type=int)
+    parser.add_argument('--eval_freq', default=200000, type=int)
     # How often (time steps) we save the trained model
-    parser.add_argument('--save_model_freq', default=20000, type=int)
+    parser.add_argument('--save_model_freq', default=200000, type=int)
     # Max time steps to run environment
-    parser.add_argument('--max_timesteps', default=6e6, type=int)
+    parser.add_argument('--max_timesteps', default=2e6, type=int)
     # replay buffer, capacity per agent (keep it small to fit in RAM)
     parser.add_argument("--replay_buffer_capacity", default=30000, type=int)
     # number of robots sharing the same crowd environment (multi-agent)
     parser.add_argument("--robot_num", default=2, type=int)
+    # CTDE: train with a shared centralized critic (MADDPG-style) using a global
+    # replay buffer; execution remains decentralized. Only used when robot_num>1.
+    parser.add_argument('--use_centralized_critic', action='store_true', default=False)
+    # robot-robot social discomfort margin (extra distance kept from other robots)
+    parser.add_argument('--robot_discomfort', type=float, default=0.3)
+    parser.add_argument('--robot_discomfort_penalty', type=float, default=1.0)
+    # high-level LLM/rule arbitration layer for robot-robot conflicts (test-time)
+    parser.add_argument('--llm_arbitrator', action='store_true', default=False,
+                        help='enable conflict arbitration during evaluation')
+    parser.add_argument('--arbitrator_mode', default='llm', type=str,
+                        help="'llm' (local Ollama, falls back to rules) or 'rule'")
+    parser.add_argument('--arbitrator_model', default='qwen2.5:7b', type=str)
+    parser.add_argument('--arbitrator_yield_factor', default=0.3, type=float)
+    parser.add_argument('--arbitrator_conflict_dist', default=1.5, type=float)
+    # ablation switches (turn off for controlled experiments)
+    parser.add_argument('--disable_emotion', action='store_true', default=False,
+                        help='set all pedestrian emotions to 0 (emotion-unaware baseline)')
+    parser.add_argument('--disable_robot_relative', action='store_true', default=False,
+                        help='remove inter-robot features from the observation and reward (no-coordination baseline)')
     
     # training
     parser.add_argument('--batch_size', default=128, type=int)
@@ -202,6 +255,14 @@ def main():
     parser.add_argument('--image_size', default=84, type=int)
     parser.add_argument('--frame_stack', default=7, type=int)
     parser.add_argument('--grid_map', action='store_true', default=False)
+    # optional tag appended to the log dir to separate experiments
+    parser.add_argument('--tag', type=str, default='',
+                        help='suffix appended to the log directory to separate experiments')
+    # OPT-IN replay-buffer persistence (OFF by default). The original workflow
+    # resumes with an empty buffer + warm-up; saving the ~3GB buffer is memory-
+    # heavy and can trigger OOM on low-RAM machines.
+    parser.add_argument('--save_buffer', action='store_true', default=False,
+                        help='persist replay buffer so a resumed session has no cold start')
     # 2 robot speed, 2 local goal, 2 emotion stats (mean, max)
     parser.add_argument("--robot_goal_state_dim", type=int, default=6)
     parser.add_argument("--laser_angle_resolute", type=float, default=0.003490659)
@@ -223,6 +284,10 @@ def main():
     file_prefix = './logs/' + args.policy + '_' + args.robot_model + '_' + args.robot_eval_model + '_203550_3'
     if args.use_angular:
         file_prefix = file_prefix + '_angular'
+    # auto-separate log dirs by robot number & frame stack, plus optional --tag
+    file_prefix = file_prefix + '_r' + str(args.robot_num) + '_f' + str(args.frame_stack)
+    if args.tag != '':
+        file_prefix = file_prefix + '_' + args.tag
 
         
     file_prefix = file_prefix + '/seed_' + str(args.seed)  
@@ -324,15 +389,35 @@ def main():
         # eval/test env during evaluations
         visualizer = Visualizer3D(env)
 
+    arbitrator = None
+    if args.llm_arbitrator:
+        from arbitrator import ArbitrationLayer
+        arbitrator = ArbitrationLayer(
+            env, mode=args.arbitrator_mode, model=args.arbitrator_model,
+            yield_factor=args.arbitrator_yield_factor,
+            conflict_dist=args.arbitrator_conflict_dist)
+
     # please manually set seeds when test with digit_arsim
     # otherwise, set it as args.seed
     # set_seed_everywhere(args.seed)
-    set_seed_everywhere(args.seed)
+    # on resume, do NOT re-seed so the random scenario sequence stays continuous
+    if args.load_model == "":
+        set_seed_everywhere(args.seed)
 
     device = torch.device(args.device)
     obs_shape = (args.frame_stack, args.image_size, args.image_size)
+    # vector state: base goal/action/emotion (6) + inter-robot relative (4 each)
     robot_goal_state_dim = args.robot_goal_state_dim
+    if not args.disable_robot_relative:
+        robot_goal_state_dim += 4 * (args.robot_num - 1)
     action_shape = (2,)
+    use_ctde = args.use_centralized_critic and args.robot_num > 1
+    # each agent's image buffer is ~capacity*2*frame_stack*84*84 bytes; scale the
+    # capacity down with robot number so the total replay memory stays bounded
+    if args.robot_num > 1:
+        replay_capacity = max(10000, int(args.replay_buffer_capacity / max(1, args.robot_num - 1)))
+    else:
+        replay_capacity = args.replay_buffer_capacity
     agents = []
     for _ in range(args.robot_num):
         agent = SacAeAgent(
@@ -369,16 +454,42 @@ def main():
             )
         agents.append(agent)
     
-    replay_buffers = []
-    for _ in range(args.robot_num):
-        replay_buffers.append(ReplayBuffer(
-            obs_shape,
-            robot_goal_state_dim, 
-            action_shape,
-            capacity=args.replay_buffer_capacity,
-            batch_size=args.batch_size,
-            device=device
-        ))
+    replay_buffers = None
+    multi_replay_buffer = None
+    centralized_critic = None
+    centralized_critic_target = None
+    centralized_critic_optimizer = None
+    if use_ctde:
+        from algos.SAC_AE.ctde import CentralizedCritic, update_multi
+        from algos.SAC_AE.utils import MultiAgentReplayBuffer
+        centralized_critic = CentralizedCritic(
+            args.robot_num, args.encoder_feature_dim, robot_goal_state_dim,
+            action_shape[0], args.hidden_dim).to(device)
+        centralized_critic_target = CentralizedCritic(
+            args.robot_num, args.encoder_feature_dim, robot_goal_state_dim,
+            action_shape[0], args.hidden_dim).to(device)
+        centralized_critic_target.load_state_dict(centralized_critic.state_dict())
+        enc_params = []
+        for a in agents:
+            enc_params += list(a.critic.encoder.parameters())
+        centralized_critic_optimizer = torch.optim.Adam(
+            list(centralized_critic.parameters()) + enc_params,
+            lr=args.critic_lr, betas=(args.critic_beta, 0.999))
+        multi_replay_buffer = MultiAgentReplayBuffer(
+            args.robot_num, obs_shape, robot_goal_state_dim, action_shape,
+            capacity=replay_capacity,
+            batch_size=args.batch_size, device=device)
+    else:
+        replay_buffers = []
+        for _ in range(args.robot_num):
+            replay_buffers.append(ReplayBuffer(
+                obs_shape,
+                robot_goal_state_dim, 
+                action_shape,
+                capacity=replay_capacity,
+                batch_size=args.batch_size,
+                device=device
+            ))
 
     checkpoint_steps = 0
     if args.load_model != "":
@@ -391,9 +502,34 @@ def main():
                 except Exception:
                     pass
             agent.load(load_name)
+        if centralized_critic is not None:
+            try:
+                centralized_critic.load_state_dict(torch.load(load_name + '_centralized_critic'))
+                centralized_critic_target.load_state_dict(centralized_critic.state_dict())
+            except Exception:
+                pass
         # args.load_model, format, step_NO_success_NO
         # extract the first number
         checkpoint_steps = int(args.load_model.split('_')[1])
+        # only restore the buffer when persistence is enabled
+        if args.save_buffer:
+            if multi_replay_buffer is not None:
+                path = file_buffer + '/multi_buffer.pt'
+                try:
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        multi_replay_buffer = torch.load(path)
+                        print('restored multi replay buffer: idx=%d full=%s' % (multi_replay_buffer.idx, multi_replay_buffer.full))
+                except Exception:
+                    pass
+            else:
+                for j in range(args.robot_num):
+                    path = file_buffer + '/robot_%d.pt' % j
+                    try:
+                        if os.path.exists(path) and os.path.getsize(path) > 0:
+                            replay_buffers[j] = torch.load(path)
+                            print('restored replay buffer robot %d: idx=%d full=%s' % (j, replay_buffers[j].idx, replay_buffers[j].full))
+                    except Exception:
+                        pass
 
     if args.load_test_model != "":
         print('start to test')
@@ -414,15 +550,29 @@ def main():
             current_step = 0
         if visualizer is not None:
             visualizer.env = test_env
+        if arbitrator is not None:
+            arbitrator.env = test_env
         success_rate, collision_rate, avg_nav_time = eval_policy(agents, test_env, current_step, 
                                                                  eval_episodes=test_times, save_directory=file_final_test_episodes, 
                                                                  if_save_video=if_save_video_test, final_test=True,
-                                                                 visualizer=visualizer)
+                                                                 visualizer=visualizer, arbitrator=arbitrator)
         print('success_rate, collision_rate, avg_nav_time')
         print(success_rate, collision_rate, avg_nav_time)
         return
 
     evaluations = []
+
+    # the module-level _INTERRUPTED flag is set by the SIGINT handler above
+
+    # when resuming (--load_model) the replay buffer starts empty, so re-warm it
+    # up with the loaded policy before updating again
+    # The author's original resumes immediately from an empty buffer (t >=
+    # start_timesteps is already satisfied on resume). We keep only a short
+    # warm-up so updates never sample from a degenerate (< batch) buffer.
+    if args.load_model != "":
+        update_start = checkpoint_steps + 1000
+    else:
+        update_start = args.start_timesteps
 
     lidar_images, robot_goal_emotion_states = env.reset()
     if visualizer is not None:
@@ -433,7 +583,9 @@ def main():
     episode_num = 0
 
     for t in range(checkpoint_steps + 1, int(args.max_timesteps) + 1):
-        if t == args.start_timesteps:
+        if _INTERRUPTED:
+            break
+        if t == update_start:
             print('replay buffer has been initialized')
         # Perform action
         # sample action for data collection
@@ -450,28 +602,51 @@ def main():
         episode_timesteps += 1
 
         if episode_timesteps == env.max_episode_step:
-            done_bool = 0.0
+            # timeout: no robot reached/collided -> keep all non-terminal
+            done_list = [0.0] * args.robot_num
         else:
-            any_collision = any(isinstance(info, Collision) for info in info_list)
-            all_reach = all(isinstance(info, ReachGoal) for info in info_list)
-            done_bool = 1.0 if (any_collision or all_reach) else 0.0
+            # per-robot terminal flag: a robot is terminal iff IT reached/collided
+            done_list = [1.0 if d else 0.0 for d in dones]
 
         # Store data in replay buffers
-        for j in range(args.robot_num):
-            replay_buffers[j].add(
-                lidar_images[j], robot_goal_emotion_states[j], actions[j], rewards[j],
-                next_lidar_images[j], next_robot_goal_emotion_states[j], done_bool)
+        if multi_replay_buffer is not None:
+            multi_replay_buffer.add(
+                lidar_images, robot_goal_emotion_states, actions, rewards,
+                done_list,
+                next_lidar_images, next_robot_goal_emotion_states)
+        else:
+            for j in range(args.robot_num):
+                replay_buffers[j].add(
+                    lidar_images[j], robot_goal_emotion_states[j], actions[j], rewards[j],
+                    next_lidar_images[j], next_robot_goal_emotion_states[j], done_list[j])
 
         lidar_images = next_lidar_images
         robot_goal_emotion_states = next_robot_goal_emotion_states
         episode_reward += sum(rewards)
 
-        # Train agents after collecting sufficient data
-        if t >= args.start_timesteps:
+        # Train agents after collecting sufficient data (or after re-warming
+        # the buffer on resume)
+        if t >= update_start:
             num_updates = args.start_timesteps if t == args.start_timesteps else 1
-            for j in range(args.robot_num):
+            if multi_replay_buffer is not None:
                 for _ in range(num_updates):
-                    agents[j].update(replay_buffers[j], writer, t)
+                    if _INTERRUPTED:
+                        break
+                    update_multi(
+                        agents, centralized_critic, centralized_critic_target,
+                        centralized_critic_optimizer, multi_replay_buffer,
+                        writer, t,
+                        discount=args.discount,
+                        critic_tau=args.critic_tau,
+                        encoder_tau=args.encoder_tau,
+                        actor_update_freq=args.actor_update_freq,
+                        critic_target_update_freq=args.critic_target_update_freq)
+            else:
+                for j in range(args.robot_num):
+                    for _ in range(num_updates):
+                        if _INTERRUPTED:
+                            break
+                        agents[j].update(replay_buffers[j], writer, t)
 
         # live 3D view during training
         if visualizer is not None and t % args.visualize_3d_freq == 0:
@@ -505,10 +680,13 @@ def main():
         if t % args.eval_freq == 0:
             if visualizer is not None:
                 visualizer.env = eval_env
+            if arbitrator is not None:
+                arbitrator.env = eval_env
             success_rate, collision_rate, avg_nav_time = eval_policy(agents, eval_env, t, 
                                                                      save_directory=file_evaluation_episodes, 
                                                                      if_save_video=if_save_video,
-                                                                     visualizer=visualizer)
+                                                                     visualizer=visualizer,
+                                                                     arbitrator=arbitrator)
             file_name = '/step_' + str(t) + '_success_' + str(int(success_rate * 100))
             print('success_rate, collision_rate, avg_nav_time at step ' + str(t))
             print(success_rate, collision_rate, avg_nav_time)
@@ -522,15 +700,41 @@ def main():
                         agent.save(file_models + file_name + '_robot_' + str(j))
                     else:
                         agent.save(file_models + file_name)
-                # replay_buffer.save(file_buffer)
-     
+                if centralized_critic is not None:
+                    torch.save(centralized_critic.state_dict(),
+                               file_models + file_name + '_centralized_critic')
+                # persist replay buffers only when --save_buffer is on
+                if args.save_buffer:
+                    if multi_replay_buffer is not None:
+                        torch.save(multi_replay_buffer, file_buffer + '/multi_buffer.pt')
+                    else:
+                        for j, rb in enumerate(replay_buffers):
+                            torch.save(rb, file_buffer + '/robot_%d.pt' % j)
+
+    # Ctrl+C: save the current model so training can be resumed with --load_model
+    if _INTERRUPTED:
+        save_name = '/step_%d_interrupt' % t
+        print('interrupted at step %d, saving model to %s ...' % (t, file_models + save_name))
+        save_checkpoint(agents, centralized_critic, file_models, save_name, args.robot_num)
+        # persist replay buffers only when --save_buffer is on
+        if args.save_buffer:
+            if multi_replay_buffer is not None:
+                torch.save(multi_replay_buffer, file_buffer + '/multi_buffer.pt')
+            else:
+                for j, rb in enumerate(replay_buffers):
+                    torch.save(rb, file_buffer + '/robot_%d.pt' % j)
+        print('model saved (buffer persistence %s). resume with: --load_model step_%d_interrupt' % ('on' if args.save_buffer else 'off', t))
+        sys.exit(0)
+
     print('final test')
     if visualizer is not None:
         visualizer.env = eval_env
+    if arbitrator is not None:
+        arbitrator.env = eval_env
     success_rate, collision_rate, avg_nav_time = eval_policy(agents, eval_env, t, 
                                                              eval_episodes=500, save_directory=file_final_test_episodes,
                                                              if_save_video=if_save_video, final_test=True,
-                                                             visualizer=visualizer)
+                                                             visualizer=visualizer, arbitrator=arbitrator)
     print('success_rate, collision_rate, avg_nav_time')
     print(success_rate, collision_rate, avg_nav_time)
 

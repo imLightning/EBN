@@ -35,10 +35,24 @@ class CrowdSim:
         self.robot_num = getattr(args, 'robot_num', 1)
         # minimum spawn distance between robots
         self.robot_min_spacing = 2.0
+        # robot-robot social discomfort margin and penalty (keep robots apart)
+        self.robot_discomfort = getattr(args, 'robot_discomfort', 0.3)
+        self.robot_discomfort_penalty = getattr(args, 'robot_discomfort_penalty', 1.0)
+        # ablation: if set, ignore emotion (set all emotion values to 0)
+        self.disable_emotion = getattr(args, 'disable_emotion', False)
+        # ablation: if set, do not add inter-robot features to the observation
+        self.disable_robot_relative = getattr(args, 'disable_robot_relative', False)
+        # when the coordination signal is removed, also disable the robot-robot
+        # discomfort reward so it does not send a mixed signal
+        if self.disable_robot_relative:
+            self.robot_discomfort = 0.0
+            self.robot_discomfort_penalty = 0.0
 
         # last-time distance from each robot to its goal
         self.goal_distance_last_list = [0.0 for _ in range(self.robot_num)]
         self.goal_distance_last = None
+        # whether each robot has already reached its goal (avoid repeated success reward)
+        self.reached_list = [False for _ in range(self.robot_num)]
 
         
         # scan_intersection, each line connects the robot and the end of each laser beam
@@ -234,7 +248,7 @@ class CrowdSim:
                 # px, py, gx, gy, vx, vy, theta
                 human_theta = atan2(-py - py, -px - px)
                 human.set(px, py, -px, -py, 0, 0, human_theta)
-                human.emotion_value = np.random.uniform(0.0, 1.0)
+                human.emotion_value = 0.0 if self.disable_emotion else np.random.uniform(0.0, 1.0)
                 break
         
         return human
@@ -597,12 +611,25 @@ class CrowdSim:
                 angular_reward = 0.0
             
             reward = collision_layer * self.collision_layer_penalty + dis_goal_reward + angular_reward
+            # robot-robot social discomfort: keep distance from other robots
+            for k in range(self.robot_num):
+                if k == j:
+                    continue
+                dis_rr = hypot(robot.px - self.robots[k].px, robot.py - self.robots[k].py)
+                margin_rr = robot.radius + self.robots[k].radius + self.robot_discomfort
+                if dis_rr < margin_rr:
+                    reward += (dis_rr - margin_rr) * self.robot_discomfort_penalty
             if collision:
                 reward = self.collision_penalty
                 done = True
                 info = Collision()
             elif reaching_goal:
-                reward = self.success_reward
+                if not self.reached_list[j]:
+                    reward = self.success_reward
+                    self.reached_list[j] = True
+                else:
+                    # already reached: no repeated success reward while waiting
+                    reward = 0.0
                 done = True
                 info = ReachGoal()
             elif collision_layer:
@@ -712,6 +739,7 @@ class CrowdSim:
         
         self.goal_distance_last_list = [robot.get_goal_distance() for robot in self.robots]
         self.goal_distance_last = self.goal_distance_last_list[0]
+        self.reached_list = [False for _ in range(self.robot_num)]
 
         # 3,5 save
         # np.random.seed(5)
@@ -775,12 +803,38 @@ class CrowdSim:
         r = hypot(x_rel, y_rel)
         t = atan2(y_rel, x_rel)
 
-        emotion_values = np.array([h.emotion_value for h in self.humans], dtype=np.float32)
+        # emotion statistics computed *locally* — only from pedestrians within the
+        # robot's LiDAR range (a realistic constraint for perception)
+        nearby = [h.emotion_value for h in self.humans
+                  if hypot(robot.px - h.px, robot.py - h.py) < self.laser_max_range]
+        # when robot has no pedestrian in sight, treat all emotions as neutral
+        emotion_mean = np.mean(nearby) if nearby else 0.5
+        emotion_max = np.max(nearby) if nearby else 0.5
+
         action_last = self.action_last_list[robot_idx]
-        return np.array([r / self.square_width, t / np.pi, 
-                         action_last[0] / self.action_range[1, 0],
-                         action_last[1] / self.action_range[1, 1],
-                         emotion_values.mean(), emotion_values.max()], dtype=np.float32)
+        state = [r / self.square_width, t / np.pi,
+                 action_last[0] / self.action_range[1, 0],
+                 action_last[1] / self.action_range[1, 1],
+                 emotion_mean, emotion_max]
+        # -------- inter-robot coordination features --------
+        cos_t = cos(theta)
+        sin_t = sin(theta)
+        if not self.disable_robot_relative:
+            for k in range(self.robot_num):
+                if k == robot_idx:
+                    continue
+                other = self.robots[k]
+                dx_k = other.px - robot.px
+                dy_k = other.py - robot.py
+                rx = dx_k * cos_t + dy_k * sin_t
+                ry = -dx_k * sin_t + dy_k * cos_t
+                dist = hypot(dx_k, dy_k)
+                angle = atan2(ry, rx)
+                rvx = other.vx * cos_t + other.vy * sin_t
+                rvy = -other.vx * sin_t + other.vy * cos_t
+                state += [dist / self.square_width, angle / np.pi,
+                          rvx / self.action_range[1, 0], rvy / self.action_range[1, 0]]
+        return np.array(state, dtype=np.float32)
 
     def render(self, mode='laser'):
         if mode == 'laser':
